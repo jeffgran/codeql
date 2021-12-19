@@ -56,6 +56,33 @@ class ActiveRecordModelClass extends ClassDeclaration {
     result = this.getModule().getSuperClass*().getADeclaration()
   }
 
+  string getDatabaseTableName() {
+    // table name is overridden in the class explicitly
+    exists(ActiveRecordModelClassMethodCall m |
+      m.getReceiverClass() = this and
+      m.getMethodName() = "table_name=" and
+      result = m.getArgument(0).(AssignExpr).getRightOperand().(Literal).getValueText() // WTF? the method `.table_name=`.getArgument(0) returns an `AssignExpr`??
+    )
+    or
+    not exists(ActiveRecordModelClassMethodCall m |
+      m.getReceiverClass() = this and
+      m.getMethodName() = "table_name="
+    ) and
+    // this class directly inherits from AR::Base, use its class name as the table name
+    (this.getSuperclassExpr() instanceof ApplicationRecordAccess or this.getSuperclassExpr() instanceof ApplicationRecordAccess) and
+    result = pluralize(underscore(this.getName()))
+    or
+    // this class inherits from another class which inherits from AR::Base, so use that class's table name (STI)
+    not exists(ActiveRecordModelClassMethodCall m |
+      m.getReceiverClass() = this and
+      m.getMethodName() = "table_name="
+    ) and
+    exists(ActiveRecordModelClass other |
+      other.getModule() = resolveConstantReadAccess(this.getSuperclassExpr()) |
+      result = other.getDatabaseTableName()
+    )
+  }
+
   /**
    * Gets methods defined in this class that may access a field from the database.
    */
@@ -81,6 +108,18 @@ class ActiveRecordModelClass extends ClassDeclaration {
       )
     )
   }
+}
+
+bindingset[s]
+string underscore(string s) {
+  // adapted from https://github.com/rails/rails/blob/984c3ef2775781d47efa9f541ce570daa2434a80/activesupport/lib/active_support/inflector/methods.rb#L96-L104
+  // TODO add acronyms inflections?
+  result = s.replaceAll("::", "/").regexpReplaceAll("([A-Z]+)(?=[A-Z][a-z])|([a-z\\d])(?=[A-Z])", "$1$2_").toLowerCase()
+}
+
+bindingset[s]
+string pluralize(string s) {
+  result = s + "s" // super dumb for now
 }
 
 /** A class method call whose receiver is an `ActiveRecordModelClass`. */
