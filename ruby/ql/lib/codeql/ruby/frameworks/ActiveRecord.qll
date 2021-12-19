@@ -56,6 +56,15 @@ class ActiveRecordModelClass extends ClassDeclaration {
     result = this.getModule().getSuperClass*().getADeclaration()
   }
 
+  // attempts to get the database table name that corresponds to this class
+  // Rails has some somewhat complicated logic for how it "magically" derives
+  // the table name, but for the normal case it's pretty simple. It just
+  // takes the model name and changes it from CamelCase to snake_case, and
+  // pluralizes it. It can also be overridden explicitly by setting
+  // `self.table_name = "some_table_name"`. This predicate could be expanded to
+  // be more accurate but this does a pretty good job. It correctly got
+  // 465 out of 730 = 64%. this could be improved by porting over more logic from rails,
+  // some of which is noted below in TODOs
   string getDatabaseTableName() {
     // table name is overridden in the class explicitly
     exists(ActiveRecordModelClassMethodCall m |
@@ -64,15 +73,19 @@ class ActiveRecordModelClass extends ClassDeclaration {
       result = m.getArgument(0).(AssignExpr).getRightOperand().(Literal).getValueText() // WTF? the method `.table_name=`.getArgument(0) returns an `AssignExpr`??
     )
     or
+
+    // or this class directly inherits from AR::Base, use its class name as the table name
     not exists(ActiveRecordModelClassMethodCall m |
       m.getReceiverClass() = this and
       m.getMethodName() = "table_name="
     ) and
-    // this class directly inherits from AR::Base, use its class name as the table name
     (this.getSuperclassExpr() instanceof ApplicationRecordAccess or this.getSuperclassExpr() instanceof ApplicationRecordAccess) and
     result = pluralize(underscore(this.getName()))
     or
-    // this class inherits from another class which inherits from AR::Base, so use that class's table name (STI)
+
+    // or this class inherits from another class which inherits from AR::Base, so use that class's table name (STI)
+    // TODO we need to look for a `table_name=` on any modules in the scope heirarchy, not just the ultimate inheritor from AR:Base
+    // TODO we also need to look for `def table_name; "foos"; end` I think
     not exists(ActiveRecordModelClassMethodCall m |
       m.getReceiverClass() = this and
       m.getMethodName() = "table_name="
@@ -80,6 +93,28 @@ class ActiveRecordModelClass extends ClassDeclaration {
     exists(ActiveRecordModelClass other |
       other.getModule() = resolveConstantReadAccess(this.getSuperclassExpr()) |
       result = other.getDatabaseTableName()
+    )
+  }
+
+  // kinda just for debugging. this gets the table name from schema.rb
+  // that matches the table name we derived above
+  string getSchemaTableName() {
+    exists(SchemaRbTable table |
+      table.getTableName() = this.getDatabaseTableName() and
+      result = table.getTableName())
+  }
+
+  // gets a database column, aka a "field" of this activerecord class
+  // it does this by matching the class's table name to the table
+  // definition from schema.rb
+  // TODO: now that we have the list of field names for each AR class,
+  // we could add more predicates here like `getAFieldAccess`, `getAFieldAssignment`, etc
+  // that would return DataFlow nodes. these would be super useful for tracking data
+  // flowing into and out of the database
+  string getAFieldName() {
+    exists(SchemaRbTable table |
+      table.getTableName() = this.getDatabaseTableName() and
+      result = table.getAColumn().getColumnName()
     )
   }
 
@@ -113,13 +148,15 @@ class ActiveRecordModelClass extends ClassDeclaration {
 bindingset[s]
 string underscore(string s) {
   // adapted from https://github.com/rails/rails/blob/984c3ef2775781d47efa9f541ce570daa2434a80/activesupport/lib/active_support/inflector/methods.rb#L96-L104
-  // TODO add acronyms inflections?
+  // TODO add acronyms inflections
   result = s.replaceAll("::", "/").regexpReplaceAll("([A-Z]+)(?=[A-Z][a-z])|([a-z\\d])(?=[A-Z])", "$1$2_").toLowerCase()
 }
 
 bindingset[s]
 string pluralize(string s) {
-  result = s + "s" // super dumb for now
+  // super dumb for now. we'd have to import the inflections list(s) to make this smarter
+  // see: https://github.com/rails/rails/blob/984c3ef2775781d47efa9f541ce570daa2434a80/activesupport/lib/active_support/inflections.rb
+  result = s + "s"
 }
 
 /** A class method call whose receiver is an `ActiveRecordModelClass`. */
@@ -341,4 +378,70 @@ private class ActiveRecordInstanceMethodCall extends DataFlow::CallNode {
   ActiveRecordInstanceMethodCall() { this.getReceiver() = instance }
 
   ActiveRecordInstance getInstance() { result = instance }
+}
+
+
+
+// a schema definition
+// e.g. https://github.com/gothinkster/rails-realworld-example-app/blob/master/db/schema.rb#L14
+class SchemaRbDefinition extends DataFlow::CallNode {
+  SchemaRbDefinition() {
+    this = API::getTopLevelMember("ActiveRecord").getMember("Schema").getAMethodCall("define")
+  }
+}
+
+// a table definition within the schema definition:
+// e.g. https://github.com/gothinkster/rails-realworld-example-app/blob/master/db/schema.rb#L16
+class SchemaRbTable extends DataFlow::CallNode {
+  SchemaRbDefinition schema;
+
+  SchemaRbTable() {
+    this.getMethodName() = "create_table" and
+    this.asExpr().getExpr().getEnclosingCallable() = schema.asExpr().getExpr().(MethodCall).getBlock()
+  }
+
+  string getTableName() {
+    result = this.getArgument(0).asExpr().getExpr().getValueText()
+  }
+
+  DataFlow::Node getTableBlockParameter() {
+    exists(LocalVariableAccess t, DataFlow::Node node |
+      node.asExpr().getExpr() = t and
+      t = this.asExpr().getExpr().(MethodCall).getBlock().getParameter(0).getAVariable().getAnAccess() and
+      result = node
+    )
+  }
+
+  // gets a column definition belonging to this table
+  SchemaRbColumn getAColumn() {
+    exists(SchemaRbColumn col |
+      col.getTable() = this and
+      result = col
+    )
+  }
+}
+
+// a column definition
+// e.g. https://github.com/gothinkster/rails-realworld-example-app/blob/master/db/schema.rb#L17
+class SchemaRbColumn extends DataFlow::CallNode {
+  SchemaRbTable table;
+  MethodCall call;
+
+  SchemaRbColumn() {
+    not this.getMethodName() = ["index"] and // probably missing some other exceptions.
+    this.asExpr().getExpr() = call and
+    call.getEnclosingCallable() = table.asExpr().getExpr().(MethodCall).getBlock() and
+    this.getReceiver() = table.getTableBlockParameter()
+  }
+
+  string getColumnName() {
+    result = this.getArgument(0).asExpr().getExpr().getValueText()
+  }
+
+  // TODO we have more information here, like the type of column, nullability, etc
+  // we could add more helpful predicates here for that stuff.
+
+  SchemaRbTable getTable() {
+    result = table
+  }
 }
