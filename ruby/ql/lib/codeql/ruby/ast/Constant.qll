@@ -141,6 +141,49 @@ class ConstantAccess extends Expr, TConstantAccess {
    */
   predicate hasGlobalScope() { none() }
 
+  // gets the full name
+  string getFullName() {
+    exists(ConstantAccess ca | this.getScopeExpr() = ca |
+    result = ca.getFullName() + "::" + this.getName())
+    or
+    // TODO if the getScopeExpr is not a constant, try to figure out which constants it could be?
+    not exists(ConstantAccess ca | this.getScopeExpr() = ca) and
+    result = this.getName()
+  }
+
+  // get all ancestor module/class namespaces of this constant,
+  // regardless of whether we are talking about a nested
+  // "write access" or a "scope expression"/"read access".
+  // e.g.
+  // ```
+  // module Foo
+  //   module Bar
+  //     class Baz
+  //       # impl
+  //     end
+  //   end
+  // end
+  // ```
+  // for the `class Baz` node, this returns `Foo::Bar::Baz`, `Foo::Bar`, and `Foo`
+  //
+  // ```
+  // class Foo::Bar::Baz
+  //   # impl
+  // end
+  // ```
+  // likewise, for the `class Foo::Bar::Baz` here, it returns the same ancestor namespaces
+  Module getANamespace() {
+    exists(ConstantWriteAccess parent | parent = this.getEnclosingModule() | result = parent.(Namespace).getModule())
+    or
+    exists(ConstantWriteAccess parent | parent = this.getEnclosingModule() | result = parent.getANamespace())
+    or
+    exists(ConstantAccess ca, Namespace n | this.getScopeExpr() = ca and n.getQualifiedName() = ca.getFullName() | result = n.getModule())
+    or
+    exists(ConstantAccess ca | this.getScopeExpr() = ca | result = ca.getANamespace())
+    or
+    result = this.(Namespace).getModule()
+  }
+
   override string toString() { result = this.getName() }
 
   override AstNode getAChild(string pred) {
