@@ -56,6 +56,91 @@ class ActiveRecordModelClass extends ClassDeclaration {
     result = this.getModule().getSuperClass*().getADeclaration()
   }
 
+  // attempts to get the database table name that corresponds to this class
+  // Rails has some somewhat complicated logic for how it "magically" derives
+  // the table name, but for the normal case it's pretty simple. It just
+  // takes the model name and changes it from CamelCase to snake_case, and
+  // pluralizes it. It can also be overridden explicitly by setting
+  // `self.table_name = "some_table_name"`. This predicate could be expanded to
+  // be more accurate but this does a pretty good job. It correctly got
+  // 530 out of 664 = 82%. this could be improved by porting over more logic from rails,
+  // some of which is noted below in TODOs
+  string getDatabaseTableName() {
+    // table name is overridden in the class explicitly
+    exists(ActiveRecordModelClassMethodCall m |
+      m.getReceiverClass() = this and
+      m.getMethodName() = "table_name=" and
+      result = m.getArgument(0).(AssignExpr).getRightOperand().(Literal).getValueText() // WTF? the method `.table_name=`.getArgument(0) returns an `AssignExpr`??
+    )
+    or
+
+    // or this class directly inherits from AR::Base, use its class name as the table name
+    not exists(ActiveRecordModelClassMethodCall m |
+      m.getReceiverClass() = this and
+      m.getMethodName() = "table_name="
+    ) and
+    (this.getSuperclassExpr() instanceof ApplicationRecordAccess or this.getSuperclassExpr() instanceof ApplicationRecordAccess) and
+    result = pluralize(underscore(this.getName()))
+    or
+
+    // or this class inherits from another class which inherits from AR::Base, so use that class's table name (STI)
+    // TODO we need to look for a `table_name=` on any modules in the scope heirarchy, not just the ultimate inheritor from AR:Base
+    // TODO we also need to look for `def table_name; "foos"; end` I think
+    not exists(ActiveRecordModelClassMethodCall m |
+      m.getReceiverClass() = this and
+      m.getMethodName() = "table_name="
+    ) and
+    exists(ActiveRecordModelClass other |
+      other.getModule() = resolveConstantReadAccess(this.getSuperclassExpr()) |
+      result = other.getDatabaseTableName()
+    )
+    or
+    // TODO should exclude the above results and make this mutually exclusive here
+    result = pluralize(underscore(this.getName()))
+  }
+
+  // look in all ancestor namespaces for a `table_name_prefix` definition
+  string getDatabaseTableNamePrefix() {
+    // this is still a little hacky. just grabbing any string/symbol literal from the method and using that.
+    // this works because usually this method looks like:
+    // def self.table_name_prefix
+    //   "some_prefix_"
+    // end
+    // but if there's a different implementation this could give weird results
+    result = this.getANamespace().getADeclaration().getMethod("table_name_prefix").getAStmt().(StringlikeLiteral).getValueText()
+    or
+    result = ""
+  }
+
+  // get the full database table name including prefix
+  string getFullDatabaseTableName() {
+    this.getDatabaseTableNamePrefix() = "" and result = this.getDatabaseTableName()
+    or
+    (not this.getDatabaseTableNamePrefix() = "") and result = this.getDatabaseTableNamePrefix() + this.getDatabaseTableName()
+  }
+
+  // kinda just for debugging. this gets the table name from schema.rb
+  // that matches the table name we derived above
+  string getSchemaTableName() {
+    exists(SchemaRbTable table |
+      table.getTableName() = this.getFullDatabaseTableName() and
+      result = table.getTableName())
+  }
+
+  // gets a database column, aka a "field" of this activerecord class
+  // it does this by matching the class's table name to the table
+  // definition from schema.rb
+  // TODO: now that we have the list of field names for each AR class,
+  // we could add more predicates here like `getAFieldAccess`, `getAFieldAssignment`, etc
+  // that would return DataFlow nodes. these would be super useful for tracking data
+  // flowing into and out of the database
+  string getAFieldName() {
+    exists(SchemaRbTable table |
+      table.getTableName() = this.getDatabaseTableName() and
+      result = table.getAColumn().getColumnName()
+    )
+  }
+
   /**
    * Gets methods defined in this class that may access a field from the database.
    */
@@ -81,6 +166,74 @@ class ActiveRecordModelClass extends ClassDeclaration {
       )
     )
   }
+}
+
+bindingset[s]
+string underscore(string s) {
+  // adapted from https://github.com/rails/rails/blob/984c3ef2775781d47efa9f541ce570daa2434a80/activesupport/lib/active_support/inflector/methods.rb#L96-L104
+  // TODO add acronyms inflections
+  result = s.replaceAll("::", "/").regexpReplaceAll("([A-Z]+)(?=[A-Z][a-z])|([a-z\\d])(?=[A-Z])", "$1$2_").toLowerCase()
+}
+
+
+// note that this can currently return multiple values because I'm not sure how to make these all mutually exclusive.
+// ideally as soon as it matches one it would "short circuit" the rest of them but not sure how to do that in codeql
+bindingset[s]
+string pluralize(string s) {
+  // adapted from: https://github.com/rails/rails/blob/984c3ef2775781d47efa9f541ce570daa2434a80/activesupport/lib/active_support/inflections.rb
+  s.regexpMatch(".*person$") and result = s.regexpReplaceAll("person$", "people")
+  or
+  s.regexpMatch(".*man$") and result = s.regexpReplaceAll("man$", "men")
+  or
+  s.regexpMatch(".*child$") and result = s.regexpReplaceAll("child$", "children")
+  or
+  s.regexpMatch(".*sex$") and result = s.regexpReplaceAll("sex$", "sexes")
+  or
+  s.regexpMatch(".*move$") and result = s.regexpReplaceAll("move$", "moves")
+  or
+  s.regexpMatch(".*zombie$") and result = s.regexpReplaceAll("zombie$", "zombies")
+  or
+  s.regexpMatch(".*(quiz)$") and result = s.regexpReplaceAll("(quiz)$", "$1zes")
+  or
+  s.regexpMatch("^(oxen)$") and result = s.regexpReplaceAll("^(oxen)$", "$1")
+  or
+  s.regexpMatch("^(ox)$") and result = s.regexpReplaceAll("^(ox)$", "$1en")
+  or
+  s.regexpMatch("^(m|l)ice$") and result = s.regexpReplaceAll("^(m|l)ice$", "$1ice")
+  or
+  s.regexpMatch("^(m|l)ouse$") and result = s.regexpReplaceAll("^(m|l)ouse$", "$1ice")
+  or
+  s.regexpMatch(".*(matr|vert|ind)(?:ix|ex)$") and result = s.regexpReplaceAll("(matr|vert|ind)(?:ix|ex)$", "$1ices")
+  or
+  s.regexpMatch(".*(x|ch|ss|sh)$") and result = s.regexpReplaceAll("(x|ch|ss|sh)$", "$1es")
+  or
+  s.regexpMatch(".*([^aeiouy]|qu)y$") and result = s.regexpReplaceAll("([^aeiouy]|qu)y$", "$1ies")
+  or
+  s.regexpMatch(".*(hive)$") and result = s.regexpReplaceAll("(hive)$", "$1s")
+  or
+  s.regexpMatch(".*(?:([^f])fe|([lr])f)$") and result = s.regexpReplaceAll("(?:([^f])fe|([lr])f)$", "$1$2ves")
+  or
+  s.regexpMatch(".*sis$") and result = s.regexpReplaceAll("sis$", "ses")
+  or
+  s.regexpMatch(".*([ti])a$") and result = s.regexpReplaceAll("([ti])a$", "$1a")
+  or
+  s.regexpMatch(".*([ti])um$") and result = s.regexpReplaceAll("([ti])um$", "$1a")
+  or
+  s.regexpMatch(".*(buffal|tomat)o$") and result = s.regexpReplaceAll("(buffal|tomat)o$", "$1oes")
+  or
+  s.regexpMatch(".*(bu)s$") and result = s.regexpReplaceAll("(bu)s$", "$1ses")
+  or
+  s.regexpMatch(".*(alias|status)$") and result = s.regexpReplaceAll("(alias|status)$", "$1es")
+  or
+  s.regexpMatch(".*(octop|vir)i$") and result = s.regexpReplaceAll("(octop|vir)i$", "$1i")
+  or
+  s.regexpMatch(".*(octop|vir)us$") and result = s.regexpReplaceAll("(octop|vir)i$", "$1i")
+  or
+  s.regexpMatch("^(ax|test)is$") and result = s.regexpReplaceAll("^(ax|test)is$", "$1es")
+  or
+  s.regexpMatch(".*s$") and result = s.regexpReplaceAll("s$", "s")
+  or
+  s.regexpMatch(".*$") and result = s.regexpReplaceAll("$", "s")
 }
 
 /** A class method call whose receiver is an `ActiveRecordModelClass`. */
@@ -302,4 +455,70 @@ private class ActiveRecordInstanceMethodCall extends DataFlow::CallNode {
   ActiveRecordInstanceMethodCall() { this.getReceiver() = instance }
 
   ActiveRecordInstance getInstance() { result = instance }
+}
+
+
+
+// a schema definition
+// e.g. https://github.com/gothinkster/rails-realworld-example-app/blob/master/db/schema.rb#L14
+class SchemaRbDefinition extends DataFlow::CallNode {
+  SchemaRbDefinition() {
+    this = API::getTopLevelMember("ActiveRecord").getMember("Schema").getAMethodCall("define")
+  }
+}
+
+// a table definition within the schema definition:
+// e.g. https://github.com/gothinkster/rails-realworld-example-app/blob/master/db/schema.rb#L16
+class SchemaRbTable extends DataFlow::CallNode {
+  SchemaRbDefinition schema;
+
+  SchemaRbTable() {
+    this.getMethodName() = "create_table" and
+    this.asExpr().getExpr().getEnclosingCallable() = schema.asExpr().getExpr().(MethodCall).getBlock()
+  }
+
+  string getTableName() {
+    result = this.getArgument(0).asExpr().getExpr().getValueText()
+  }
+
+  DataFlow::Node getTableBlockParameter() {
+    exists(LocalVariableAccess t, DataFlow::Node node |
+      node.asExpr().getExpr() = t and
+      t = this.asExpr().getExpr().(MethodCall).getBlock().getParameter(0).getAVariable().getAnAccess() and
+      result = node
+    )
+  }
+
+  // gets a column definition belonging to this table
+  SchemaRbColumn getAColumn() {
+    exists(SchemaRbColumn col |
+      col.getTable() = this and
+      result = col
+    )
+  }
+}
+
+// a column definition
+// e.g. https://github.com/gothinkster/rails-realworld-example-app/blob/master/db/schema.rb#L17
+class SchemaRbColumn extends DataFlow::CallNode {
+  SchemaRbTable table;
+  MethodCall call;
+
+  SchemaRbColumn() {
+    not this.getMethodName() = ["index"] and // probably missing some other exceptions.
+    this.asExpr().getExpr() = call and
+    call.getEnclosingCallable() = table.asExpr().getExpr().(MethodCall).getBlock() and
+    this.getReceiver() = table.getTableBlockParameter()
+  }
+
+  string getColumnName() {
+    result = this.getArgument(0).asExpr().getExpr().getValueText()
+  }
+
+  // TODO we have more information here, like the type of column, nullability, etc
+  // we could add more helpful predicates here for that stuff.
+
+  SchemaRbTable getTable() {
+    result = table
+  }
 }
